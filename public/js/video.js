@@ -487,6 +487,7 @@ const VideoChat = (() => {
       showToast("Room ID must be exactly 6 characters using only uppercase letters (A-Z except I,O) and digits (2-9)", "error");
       return;
     }
+
     if (remotePeerId === state.peerId) {
       showToast("You cannot call yourself", "warning");
       return;
