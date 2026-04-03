@@ -15,7 +15,7 @@ PAGES_MAP = {
     '/consent': 'consent.html',
 }
 
-API_PREFIX = '/api/'
+API_PREFIX = '/api'
 ROOM_ID_PATTERN = re.compile(r'^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$')
 
 
@@ -48,7 +48,7 @@ class Default(WorkerEntrypoint):
             return cors_response()
 
         # Basic JSON APIs
-        if path.startswith(API_PREFIX):
+        if path == API_PREFIX or path.startswith(API_PREFIX + '/'):
             if request.method != 'GET':
                 return self._json_error(
                     status=405,
