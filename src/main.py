@@ -2,7 +2,6 @@
 from workers import WorkerEntrypoint, Response
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
-from datetime import datetime, timezone
 import re
 
 from src.libs.utils import cors_response, html_response, json_response
@@ -23,17 +22,6 @@ class Default(WorkerEntrypoint):
     """Worker entrypoint for handling HTTP requests and serving content."""
 
     @staticmethod
-    def _json_error(status: int, code: str, message: str) -> Response:
-        """Return a consistent JSON error payload for API endpoints."""
-        return json_response({
-            'ok': False,
-            'error': {
-                'code': code,
-                'message': message,
-            },
-        }, status=status)
-
-    @staticmethod
     def _validate_room_id(room_id: str) -> bool:
         """Validate room IDs using the same format as the frontend."""
         return bool(ROOM_ID_PATTERN.fullmatch(room_id.strip()))
@@ -49,30 +37,27 @@ class Default(WorkerEntrypoint):
 
         # Basic JSON APIs
         if path == API_PREFIX or path.startswith(API_PREFIX + '/'):
-            if request.method != 'GET':
-                return self._json_error(
-                    status=405,
-                    code='method_not_allowed',
-                    message='Only GET is supported for this endpoint.',
-                )
-
-            if path == '/api/health':
-                return json_response({
-                    'ok': True,
-                    'service': 'blt-safecloak',
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                })
-
             if path == '/api/rooms/validate':
+                if request.method != 'GET':
+                    return json_response({
+                        'ok': False,
+                        'error': {
+                            'code': 'method_not_allowed',
+                            'message': 'Only GET is supported for this endpoint.',
+                        },
+                    }, status=405)
+
                 query = parse_qs(url.query)
                 room_id = query.get('room', [''])[0].strip()
 
                 if not room_id:
-                    return self._json_error(
-                        status=400,
-                        code='missing_room_id',
-                        message="Query parameter 'room' is required.",
-                    )
+                    return json_response({
+                        'ok': False,
+                        'error': {
+                            'code': 'missing_room_id',
+                            'message': "Query parameter 'room' is required.",
+                        },
+                    }, status=400)
 
                 return json_response({
                     'ok': True,
@@ -80,11 +65,13 @@ class Default(WorkerEntrypoint):
                     'isValid': self._validate_room_id(room_id),
                 })
 
-            return self._json_error(
-                status=404,
-                code='api_not_found',
-                message='API endpoint not found.',
-            )
+            return json_response({
+                'ok': False,
+                'error': {
+                    'code': 'api_not_found',
+                    'message': 'API endpoint not found.',
+                },
+            }, status=404)
 
         # Handle GET requests for HTML pages
         if request.method == 'GET' and path in PAGES_MAP:
