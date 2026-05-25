@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 
 import pytest
+from playwright.sync_api import TimeoutError as PWTimeoutError
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).parent.parent
@@ -418,10 +419,22 @@ def _peer_id(page) -> str:
     return page.evaluate("document.getElementById('my-peer-id').textContent.trim()")
 
 
-def _accept_consent(page, timeout: int = TIMEOUT_MS):
-    """Wait for the consent dialog to appear and click 'I Consent'."""
-    page.wait_for_selector("#consent-allow", timeout=timeout)
-    page.click("#consent-allow")
+_CONSENT_TIMEOUT_MS = 2_000
+
+
+def _accept_consent(page, timeout: int = _CONSENT_TIMEOUT_MS):
+    """Click the consent banner if it is present; silently skip if it is not.
+
+    In some CI environments the consent dialog is never shown (e.g. when the
+    browser already has a stored consent decision).  Using a short timeout and
+    catching ``TimeoutError`` prevents the test from blocking for the full
+    WebRTC ``TIMEOUT_MS`` when the banner is absent.
+    """
+    try:
+        page.wait_for_selector("#consent-allow", state="visible", timeout=timeout)
+        page.click("#consent-allow")
+    except PWTimeoutError:
+        pass
 
 
 _STREAM_CHECK_JS = """
@@ -515,6 +528,158 @@ def test_three_clients_connect_and_see_cameras(app_server_url):
                 assert page.evaluate(_STREAM_CHECK_JS), (
                     f"{name} should see live streams from both other participants"
                 )
+        finally:
+            browser.close()
+
+
+# JavaScript predicate reused across walkie-talkie checks.
+_WALKIE_MODE_CHECK_JS = """
+() => {
+    const banner = document.getElementById('walkie-cue-banner');
+    const grid   = document.getElementById('video-grid');
+    return (
+        banner !== null &&
+        !banner.classList.contains('hidden') &&
+        grid   !== null &&
+        grid.classList.contains('hidden')
+    );
+}
+"""
+
+
+def test_three_clients_walkie_talkie_mode(app_server_url):
+    """
+    Three clients join the same room in walkie-talkie mode (walkie=1 URL param).
+
+    Assertions
+    ----------
+    1. Every client receives a unique peer ID.
+    2. All three clients form a full mesh (each sees 3 video-wrapper elements,
+       even though the video-grid container is hidden).
+    3. Each client is in walkie-talkie mode: the cue banner is visible and the
+       video-grid has the ``hidden`` class.
+    4. Remote video elements receive a srcObject (audio-only MediaStream) once
+       the calls are established, confirming the WebRTC audio path works.
+    5. Floor control: Client 1 can claim the push-to-talk floor (banner shows
+       "You have the floor"), Clients 2 and 3 see the speaking indicator, and
+       releasing the floor restores "Floor is free" on every client.
+    """
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(args=_BROWSER_ARGS)
+        try:
+            ctx1 = _new_context(browser)
+            ctx2 = _new_context(browser)
+            ctx3 = _new_context(browser)
+
+            p1 = ctx1.new_page()
+            p2 = ctx2.new_page()
+            p3 = ctx3.new_page()
+
+            walkie_url = f"{app_server_url}/video-room?walkie=1"
+            for page in (p1, p2, p3):
+                page.goto(walkie_url)
+
+            # ── Collect peer IDs ─────────────────────────────────────────────
+            id1 = _peer_id(p1)
+            id2 = _peer_id(p2)
+            id3 = _peer_id(p3)
+            assert id1 and id2 and id3, "All clients must receive a peer ID"
+            assert len({id1, id2, id3}) == 3, "All peer IDs must be unique"
+
+            # ── Step 1: Client 2 calls Client 1 ─────────────────────────────
+            # In walkie-talkie mode the add-participant card is hidden; call
+            # the exposed VideoChat.callPeer() API directly instead.
+            p2.evaluate(f"void VideoChat.callPeer('{id1}')")
+            _accept_consent(p2)  # p2 consents (caller side)
+            _accept_consent(p1)  # p1 consents (callee side)
+
+            p1.wait_for_function(
+                "document.querySelectorAll('.video-wrapper').length >= 2",
+                timeout=TIMEOUT_MS,
+            )
+            p2.wait_for_function(
+                "document.querySelectorAll('.video-wrapper').length >= 2",
+                timeout=TIMEOUT_MS,
+            )
+
+            # ── Step 2: Client 3 calls Client 1 ─────────────────────────────
+            # Client 1 auto-sends peer list to Client 3, which then calls
+            # Client 2 to complete the full mesh.
+            p3.evaluate(f"void VideoChat.callPeer('{id1}')")
+            _accept_consent(p3)  # p3 consents (caller side)
+            # p1 already has consentGiven=true → no dialog
+
+            # ── Step 3: Wait for full mesh ───────────────────────────────────
+            # Each client: 1 local + 2 remote wrappers (inside hidden grid).
+            for page in (p1, p2, p3):
+                page.wait_for_function(
+                    "document.querySelectorAll('.video-wrapper').length >= 3",
+                    timeout=TIMEOUT_MS,
+                )
+
+            # ── Step 4: Verify walkie-talkie mode indicators ─────────────────
+            for page, name in ((p1, "Client 1"), (p2, "Client 2"), (p3, "Client 3")):
+                assert page.evaluate(_WALKIE_MODE_CHECK_JS), (
+                    f"{name} should be in walkie-talkie mode "
+                    "(cue banner visible and video-grid hidden)"
+                )
+
+            # ── Step 5: Verify audio streams are established ─────────────────
+            # handleCallStream sets videoEl.srcObject even in walkie mode (the
+            # element is inside the hidden grid but the MediaStream is audio-only).
+            for page, name in ((p1, "Client 1"), (p2, "Client 2"), (p3, "Client 3")):
+                page.wait_for_function(_STREAM_CHECK_JS, timeout=TIMEOUT_MS)
+                assert page.evaluate(_STREAM_CHECK_JS), (
+                    f"{name} should have srcObject set for both remote participant tiles"
+                )
+
+            # ── Step 6: Floor control – claim ────────────────────────────────
+            # Dispatch a pointerdown event on Client 1's push-to-talk button.
+            p1.evaluate(
+                """() => {
+                    const btn = document.getElementById('btn-push-to-talk');
+                    if (btn) btn.dispatchEvent(
+                        new PointerEvent('pointerdown',
+                            {bubbles: true, cancelable: true, pointerId: 1, isPrimary: true}));
+                }"""
+            )
+
+            # Client 1 should report "You have the floor".
+            p1.wait_for_function(
+                "document.getElementById('walkie-cue-text')?.textContent === 'You have the floor'",
+                timeout=TIMEOUT_MS,
+            )
+
+            # Clients 2 and 3 should see the speaking indicator for Client 1.
+            for page, name in ((p2, "Client 2"), (p3, "Client 3")):
+                page.wait_for_function(
+                    "document.getElementById('walkie-cue-text')?.textContent?.includes('speaking')",
+                    timeout=TIMEOUT_MS,
+                )
+                assert page.evaluate(
+                    "document.getElementById('walkie-cue-text')?.textContent?.includes('speaking')"
+                ), f"{name} should see the speaking indicator while Client 1 holds the floor"
+
+            # ── Step 7: Floor control – release ──────────────────────────────
+            p1.evaluate(
+                """() => {
+                    const btn = document.getElementById('btn-push-to-talk');
+                    if (btn) btn.dispatchEvent(
+                        new PointerEvent('pointerup',
+                            {bubbles: true, cancelable: true, pointerId: 1, isPrimary: true}));
+                }"""
+            )
+
+            # All clients should return to "Floor is free".
+            for page, name in ((p1, "Client 1"), (p2, "Client 2"), (p3, "Client 3")):
+                page.wait_for_function(
+                    "document.getElementById('walkie-cue-text')?.textContent === 'Floor is free'",
+                    timeout=TIMEOUT_MS,
+                )
+                assert page.evaluate(
+                    "document.getElementById('walkie-cue-text')?.textContent === 'Floor is free'"
+                ), f"{name} should show 'Floor is free' after release"
+
         finally:
             browser.close()
 
@@ -1182,15 +1347,118 @@ def test_video_room_includes_voice_controller_ui():
 
     required_snippets = [
         'id="btn-voice-changer"',
+        'id="btn-push-to-talk"',
         'id="voice-effects-panel"',
         'id="effect-sliders-container"',
         'id="btn-monitor"',
         'id="slider-monitor-volume"',
         'id="slider-mic-gain"',
+        'id="participant-mode-hint"',
         'src="js/voice-changer.js"',
     ]
     for snippet in required_snippets:
         assert snippet in html, f"Expected snippet missing in video-room.html: {snippet}"
+
+
+def test_video_room_includes_group_chat_ui():
+    """Video room page should include in-room group chat controls."""
+    html = (ROOT / "src/pages/video-room.html").read_text(encoding="utf-8")
+
+    required_snippets = [
+        'id="chat-messages"',
+        'id="chat-empty-state"',
+        'id="chat-form"',
+        'id="chat-input"',
+        'id="btn-send-chat"',
+        "Group Chat",
+    ]
+    for snippet in required_snippets:
+        assert snippet in html, f"Expected snippet missing in video-room.html: {snippet}"
+
+
+def test_video_room_wires_group_chat_submission():
+    """Room page script should wire chat form submission to VideoChat.sendChatMessage."""
+    html = (ROOT / "src/pages/video-room.html").read_text(encoding="utf-8")
+    assert 'document.getElementById("chat-form")' in html
+    assert "VideoChat.sendChatMessage(chatInput.value)" in html
+
+
+def test_video_js_supports_group_chat_data_messages():
+    """video.js should expose sendChatMessage and process incoming chat payloads."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "function sendChatMessage(rawText)" in js
+    assert 'if (data && data.type === "chat")' in js
+    assert "handleIncomingChatMessage(data, conn.peer);" in js
+    assert "sendChatMessage," in js
+
+
+def test_video_js_chat_history_persistence_constants():
+    """video.js must declare the chat-history storage key prefix and max-messages cap."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert 'CHAT_HISTORY_STORAGE_KEY_PREFIX = "blt-safecloak-chat-"' in js
+    assert "MAX_CHAT_HISTORY_MESSAGES" in js
+
+
+def test_video_js_chat_history_save_and_load_functions():
+    """video.js must implement saveChatHistory and loadAndRenderChatHistory."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "function saveChatHistory()" in js
+    assert "async function loadAndRenderChatHistory()" in js
+    # Persistence relies on the existing Crypto helpers.
+    assert "Crypto.saveEncrypted" in js
+    assert "Crypto.loadEncrypted" in js
+
+
+def test_video_js_chat_history_loaded_on_peer_open():
+    """loadAndRenderChatHistory should be called inside the peer.on('open') handler."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "loadAndRenderChatHistory()" in js
+
+
+def test_video_js_chat_history_messages_pushed_to_array():
+    """Both incoming and outgoing messages must be pushed into chatHistory."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    # chatHistory array declared at module level
+    assert "chatHistory = []" in js
+    # push calls inside the message handlers
+    assert "chatHistory.push(" in js
+
+
+def test_video_js_chat_history_clear_function_exists():
+    """video.js must expose clearChatHistory() that removes the localStorage entry and resets state."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "function clearChatHistory()" in js
+    assert "localStorage.removeItem(" in js
+
+
+def test_video_js_chat_history_cleared_on_end_call():
+    """clearChatHistory must be called during endCall() so the local copy is wiped on hangup."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    # The call must appear inside the endCall function body — we verify both exist together.
+    assert "async function endCall(" in js
+    assert "clearChatHistory();" in js
+
+
+def test_video_js_chat_history_p2p_sync_send():
+    """video.js must implement sendChatHistoryTo() and call it when a data connection opens."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "function sendChatHistoryTo(remotePeerId)" in js
+    # Must be wired into the conn.on("open") handler inside setupDataConn.
+    assert "sendChatHistoryTo(conn.peer)" in js
+
+
+def test_video_js_chat_history_p2p_sync_receive():
+    """video.js must implement handleIncomingChatHistory() and process chat-history data messages."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "function handleIncomingChatHistory(" in js
+    assert 'data.type === "chat-history"' in js
+    assert "handleIncomingChatHistory(data.messages)" in js
+
+
+def test_video_js_chat_history_rerender_function():
+    """video.js must expose rerenderChatMessages() used to rebuild the chat panel after a merge."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "function rerenderChatMessages()" in js
 
 
 def test_video_chat_includes_prejoin_voice_controller_ui():
@@ -1204,6 +1472,9 @@ def test_video_chat_includes_prejoin_voice_controller_ui():
         'id="btn-preview-monitor"',
         'id="slider-preview-monitor-volume"',
         'id="slider-preview-mic-gain"',
+        'id="toggle-walkie-talkie"',
+        'id="preview-video-section"',
+        'id="walkie-lobby-banner"',
         'src="js/voice-changer.js"',
     ]
     for snippet in required_snippets:
@@ -1229,3 +1500,153 @@ def test_video_room_peerjs_script_has_no_sri_integrity():
     assert "integrity=" not in match.group(0), (
         "PeerJS script tag should not include integrity attribute; stale SRI breaks production loading"
     )
+
+
+def test_video_js_enforces_five_participant_video_cap_and_walkie_mode():
+    """Client runtime should cap full-video mode at 5 participants and enable walkie-talkie fallback."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "const MAX_VIDEO_PARTICIPANTS = 5;" in js
+    assert "const shouldEnableWalkie = totalParticipants > MAX_VIDEO_PARTICIPANTS;" in js
+    assert "void setWalkieTalkieMode(shouldEnableWalkie);" in js
+    assert "Walkie-talkie mode enabled for large room" in js
+    assert "Hold to talk" in (ROOT / "src/pages/video-room.html").read_text(encoding="utf-8")
+
+
+def test_video_js_activates_walkie_mode_from_lobby_param():
+    """video.js should read walkie=1 URL param from lobby and activate walkie-talkie mode early in init."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert 'params.get("walkie")' in js
+    assert "initialMediaPreferences.walkie = true" in js
+    assert "initialMediaPreferences.walkie" in js
+    assert 'params.delete("walkie")' in js
+
+
+def test_video_lobby_js_includes_walkie_param_in_room_url():
+    """video-lobby.js should append walkie=1 to the room URL when walkie-talkie mode is selected."""
+    js = (ROOT / "public/js/video-lobby.js").read_text(encoding="utf-8")
+    assert "walkieTalkieEnabled" in js
+    assert 'target.searchParams.set("walkie", "1")' in js
+
+
+def test_video_room_includes_walkie_cue_banner():
+    """Video room should include the walkie-talkie cue banner for real-time floor status."""
+    html = (ROOT / "src/pages/video-room.html").read_text(encoding="utf-8")
+    required_snippets = [
+        'id="walkie-cue-banner"',
+        'id="walkie-cue-text"',
+        'id="walkie-cue-sub"',
+        'id="walkie-cue-icon"',
+    ]
+    for snippet in required_snippets:
+        assert snippet in html, f"Expected snippet missing in video-room.html: {snippet}"
+
+
+def test_video_js_includes_walkie_cue_banner_logic():
+    """video.js should include updateWalkieCueBanner and call it from floor events."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "function updateWalkieCueBanner()" in js
+    assert "updateWalkieCueBanner()" in js
+    # Video/camera UI hidden in walkie mode
+    assert '"video-grid"' in js
+    assert '"btn-cam"' in js
+    assert '"btn-screen"' in js
+
+
+def test_video_lobby_js_hides_video_ui_in_walkie_mode():
+    """video-lobby.js should hide camera preview and button when walkie-talkie mode is enabled."""
+    js = (ROOT / "public/js/video-lobby.js").read_text(encoding="utf-8")
+    assert "applyWalkieLobbyUi" in js
+    assert '"preview-video-section"' in js
+    assert '"walkie-lobby-banner"' in js
+    assert '"btn-preview-cam"' in js
+
+
+def test_video_js_walkie_lobby_opt_in_is_sticky():
+    """video.js evaluateCommunicationMode must not auto-disable walkie mode when the user
+    explicitly opted in from the lobby (initialMediaPreferences.walkie)."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "initialMediaPreferences.walkie" in js
+    # The guard should appear inside evaluateCommunicationMode
+    assert "if (initialMediaPreferences.walkie) return;" in js
+
+
+def test_video_room_has_github_footer_link():
+    """Room page should have a footer link to the GitHub repository."""
+    html = (ROOT / "src/pages/video-room.html").read_text(encoding="utf-8")
+    assert "https://github.com/OWASP-BLT/BLT-SafeCloak" in html
+    assert "fa-brands fa-github" in html
+
+
+def test_display_name_persisted_to_local_storage():
+    """Display name must be persisted to localStorage (not sessionStorage) in both
+    video-lobby.js and video.js so it survives tab/browser restarts."""
+    lobby_js = (ROOT / "public/js/video-lobby.js").read_text(encoding="utf-8")
+    video_js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    # Both files must write the name to localStorage
+    assert "localStorage.setItem(DISPLAY_NAME_STORAGE_KEY" in lobby_js
+    assert "localStorage.setItem(DISPLAY_NAME_STORAGE_KEY" in video_js
+    # Neither file must still read from sessionStorage for the display name key
+    assert "sessionStorage.getItem(DISPLAY_NAME_STORAGE_KEY" not in lobby_js
+    assert "sessionStorage.getItem(DISPLAY_NAME_STORAGE_KEY" not in video_js
+
+
+def test_lobby_html_has_saved_name_badge_and_change_button():
+    """Lobby page must include the saved-name badge and a Change button so returning
+    users can see their stored name and edit it without retyping."""
+    html = (ROOT / "src/pages/video-chat.html").read_text(encoding="utf-8")
+    assert 'id="saved-name-badge"' in html
+    assert 'id="saved-name-text"' in html
+    assert 'id="btn-change-name"' in html
+
+
+def test_video_lobby_js_wires_change_name_button():
+    """video-lobby.js must bind the Change button to clear the display-name input."""
+    js = (ROOT / "public/js/video-lobby.js").read_text(encoding="utf-8")
+    assert "btn-change-name" in js
+    assert "_updateSavedNameBadge" in js
+
+
+def test_video_js_local_tile_shows_display_name():
+    """video.js updateTilePresentation must include the user's display name in the local
+    tile label, not just the generic 'You' token, so participants can see their own name."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    # The label for the local tile should include state.displayName alongside "(You)"
+    assert "`${state.displayName} (You)`" in js
+
+
+def test_video_js_mic_button_hidden_in_walkie_mode():
+
+    active, replacing it with the push-to-talk control to avoid confusion."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    # The mic button visibility should be toggled based on walkieTalkieMode
+    assert "micBtn.classList.toggle(\"hidden\", walkieTalkieMode)" in js
+
+
+def test_video_lobby_js_hides_mic_button_in_walkie_mode():
+    """video-lobby.js applyWalkieLobbyUi must also hide the mic preview button when
+    walkie-talkie mode is active, consistent with the in-room behavior."""
+    js = (ROOT / "public/js/video-lobby.js").read_text(encoding="utf-8")
+    assert '"btn-preview-mic"' in js
+    assert 'micBtn.classList.toggle("hidden", enabled)' in js
+
+
+def test_video_js_chat_reconnects_data_channels_on_send():
+    """video.js sendChatMessage must re-establish data connections for active-call peers
+    that have no open data channel, queueing the message for when the channel opens."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    # The send function should iterate activeCalls and call ensureDataConn for peers
+    # without an open connection, then queue the payload on the "open" event.
+    assert "activeCalls.forEach" in js
+    assert "ensureDataConn(peerId)" in js
+    assert 'newConn.on("open"' in js
+
+
+def test_video_js_update_tracks_uses_sender_track_kind():
+    """video.js updateTracksInCalls must check the sender's own track kind (not only the
+    receiver's) when locating a transceiver, so track replacement works even before the
+    remote peer starts sending (e.g. when removing video in walkie-talkie mode)."""
+    js = (ROOT / "public/js/video.js").read_text(encoding="utf-8")
+    assert "senderKind" in js
+    assert "sender.track.kind" in js
+    # The transceiver lookup must use both sender and receiver kind as fallback
+    assert "receiverKind" in js

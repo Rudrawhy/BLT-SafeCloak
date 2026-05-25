@@ -29,7 +29,7 @@ const ConsentManager = (() => {
   async function record(event) {
     const ts = Date.now();
     const entry = {
-      id: ts.toString() + Math.random().toString(36).slice(2, 7),
+      id: ts.toString() + Crypto.randomId(5),
       type: event.type || "recorded", // 'given' | 'withdrawn' | 'recorded'
       name: event.name || "Unnamed event",
       details: event.details || "",
@@ -165,18 +165,6 @@ const ConsentManager = (() => {
     if (recordedEl) recordedEl.textContent = log.filter((e) => e.type === "recorded").length;
   }
 
-  /* ── Utils ── */
-  function capitalise(s) {
-    return s ? s[0].toUpperCase() + s.slice(1) : "";
-  }
-  function escHtml(str) {
-    return str
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
-
   /* ── Init ── */
   async function init() {
     load();
@@ -204,7 +192,21 @@ const ConsentManager = (() => {
     if (form) {
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
+        const legalCheckbox = document.getElementById("confirm-legal");
+        if (!legalCheckbox || !legalCheckbox.checked) {
+          showToast("Please confirm the legal attestation before recording.", "error");
+          return;
+        }
+
         const fd = new FormData(form);
+        const nameField = fd.get("participant-name");
+        const name = (nameField || "").trim();
+        if (!name) {
+          showToast("Participant name is required.", "error");
+          const nameInput = document.getElementById("participant-name");
+          if (nameInput) nameInput.focus();
+          return;
+        }
         const entry = await record({
           type: fd.get("consent-type"),
           name: fd.get("participant-name"),
